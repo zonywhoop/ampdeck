@@ -2,8 +2,7 @@
 
 **The unofficial Plexamp plugin for Stream Deck+**
 
-<!-- Replace the line below with your render once it's ready -->
-<!-- ![Ampdeck on Stream Deck+](hero.png) -->
+![Ampdeck on Stream Deck+](hero.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/rackemrack)
