@@ -1,16 +1,15 @@
 # Ampdeck
 
-**The unofficial Plexamp plugin for Stream Deck+**
+**The unofficial Plexamp plugin for Stream Deck**
 
-<!-- Replace the line below with your render once it's ready -->
-<!-- ![Ampdeck on Stream Deck+](screenshots/hero.png) -->
+![Ampdeck on Stream Deck+](hero.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/rackemrack)
 
 ---
 
-Ampdeck brings Plexamp to your Stream Deck+. See your album art, track info, and playback time on the LCD keys, with a smooth animated progress bar spanning the touch strip — all updated in real time.
+Ampdeck brings Plexamp to your Stream Deck. See your album art, track info, and playback time on the LCD keys. All updated in real time. Stream Deck+ users get the full experience with a smooth animated progress bar spanning the touch strip and configurable dial controls.
 
 ## Features
 
@@ -26,9 +25,24 @@ Ampdeck brings Plexamp to your Stream Deck+. See your album art, track info, and
 - **Configurable Text Colors** — Choose from White, Light Gray, Orange, Amber, or Black to match your setup.
 - **Smooth Interpolation** — Time display updates at 200ms with configurable sync offset to stay in sync with Plexamp.
 
+## Compatibility
+
+Ampdeck works on **any Stream Deck model** — the button actions (Album Art, Play/Pause, Previous, Next, Track Info, Time Elapsed) work on every device with LCD keys. The Now Playing Strip with dials and progress bar is exclusive to the **Stream Deck+**.
+
+| Feature | Stream Deck / XL / MK.2 / Mini / Neo | Stream Deck+ |
+|---------|:-------------------------------------:|:------------:|
+| Album Art | ✓ | ✓ |
+| Play / Pause | ✓ | ✓ |
+| Previous / Next | ✓ | ✓ |
+| Track Info | ✓ | ✓ |
+| Time Elapsed | ✓ | ✓ |
+| Now Playing Strip | — | ✓ |
+| Dial Controls | — | ✓ |
+| Spanning Progress Bar | — | ✓ |
+
 ## Requirements
 
-- [Stream Deck+](https://www.elgato.com/stream-deck-plus) (requires the touch strip and dials)
+- Any [Stream Deck](https://www.elgato.com/stream-deck) model (Stream Deck+ recommended for the full experience)
 - [Plexamp](https://www.plex.tv/plexamp/) running on the same network
 - A [Plex Media Server](https://www.plex.tv/media-server-downloads/) with your music library
 
@@ -134,7 +148,7 @@ Then restart Stream Deck.
 
 ## Support
 
-If Ampdeck is useful to you, consider [buying me a coffee](https://ko-fi.com/rackemrack). It's totally optional — the plugin is free and always will be.
+If Ampdeck is useful to you, consider [buying me a coffee](https://ko-fi.com/rackemrack). It's totally optional; The plugin is free and always will be.
 
 ## License
 
