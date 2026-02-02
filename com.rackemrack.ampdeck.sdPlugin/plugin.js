@@ -1,5 +1,6 @@
-// Ampdeck v1.0.1 - Stream Deck Plugin for Plexamp
-// Dual Web Worker architecture: poll worker (Plex sync) + render worker (interpolated display)
+// Ampdeck v1.1.0 - Stream Deck Plugin for Plexamp
+// Local player API for commands + timeline poll for real-time playback position
+// Server connection retained for metadata and album art
 
 var websocket = null;
 var pluginUUID = null;
@@ -16,12 +17,10 @@ var lastArtPath = null;
 var albumTrackCount = null;
 var lastParentRatingKey = null;
 
-// Interpolation state
-var serverPosition = 0;
-var serverTimestamp = 0;
-var lastServerPosition = -1;
-var displayPosition = 0;
+// Playback position (real-time from timeline poll)
+var currentPosition = 0;
 var displayProgress = 0;
+var lastPositionTimestamp = 0;
 
 // Layout state (avoid resending unchanged layouts)
 var lastLayoutState = {};
@@ -36,16 +35,53 @@ var SEEK_AMOUNT = 10000;
 var currentVolume = 50;
 var VOLUME_STEP = 5;
 
+// Shuffle/Repeat state
+var currentShuffle = 0;
+var currentRepeat = 0;
+
+// Local player API command tracking
+var localCommandID = 0;
+var CLIENT_IDENTIFIER = "com.rackemrack.ampdeck";
+
+// Connection state tracking
+var localPlayerConnected = false;
+var serverConnected = false;
+var lastTimelineRatingKey = null;
+
+// Touch strip overlay state (per-context)
+var stripOverlays = {};
+
 // Workers
 var pollWorker = null;
 var renderWorker = null;
-var pollBlobUrl = null;
-var renderBlobUrl = null;
 
-function log(msg, data) {
-    var ts = new Date().toISOString().substr(11, 8);
-    if (data !== undefined) console.log("[Ampdeck " + ts + "] " + msg, data);
-    else console.log("[Ampdeck " + ts + "] " + msg);
+// ============================================
+// LOGGING SYSTEM
+// ============================================
+var LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+var currentLogLevel = LOG_LEVELS.INFO;
+
+function log(msg, data) { logAt("INFO", msg, data); }
+function logDebug(msg, data) { logAt("DEBUG", msg, data); }
+function logWarn(msg, data) { logAt("WARN", msg, data); }
+function logError(msg, data) { logAt("ERROR", msg, data); }
+
+function logAt(level, msg, data) {
+    if (LOG_LEVELS[level] < currentLogLevel) return;
+    var ts = new Date().toISOString().substr(11, 12);
+    var prefix = "[Ampdeck " + ts + " " + level + "] ";
+    var sanitized = sanitizeLog(msg);
+    if (data !== undefined) console.log(prefix + sanitized, data);
+    else console.log(prefix + sanitized);
+}
+
+function sanitizeLog(msg) {
+    // Mask Plex tokens in log output
+    return msg.replace(/X-Plex-Token=[^&\s"']+/gi, "X-Plex-Token=***");
+}
+
+function updateLogLevel() {
+    currentLogLevel = globalSettings.debugMode ? LOG_LEVELS.DEBUG : LOG_LEVELS.INFO;
 }
 
 // ============================================
@@ -57,7 +93,6 @@ function getTextColor() {
 
 function getSecondaryTextColor() {
     var tc = getTextColor();
-    // Return a dimmer version for secondary text
     if (tc === "#FFFFFF") return "#888888";
     if (tc === "#BBBBBB") return "#777777";
     if (tc === "#E5A00D") return "#B07A0A";
@@ -71,21 +106,29 @@ function getAccentColor() {
     return dominantColor;
 }
 
+function getPlayerUrl() {
+    return globalSettings.playerUrl || "http://localhost:32500";
+}
+
+function getNextCommandID() {
+    localCommandID++;
+    return localCommandID;
+}
+
 // ============================================
-// INTERPOLATION
+// DISPLAY POSITION
 // ============================================
-function updateInterpolatedPosition() {
-    if (playbackState === "playing" && serverTimestamp > 0) {
-        var elapsed = Date.now() - serverTimestamp;
-        displayPosition = Math.min(serverPosition + elapsed, trackDuration);
-    } else {
-        displayPosition = serverPosition;
+function updateDisplayPosition() {
+    if (playbackState === "playing" && lastPositionTimestamp > 0) {
+        var elapsed = Date.now() - lastPositionTimestamp;
+        currentPosition = Math.min(currentPosition + elapsed, trackDuration);
+        lastPositionTimestamp = Date.now();
     }
-    displayProgress = trackDuration > 0 ? (displayPosition / trackDuration) * 100 : 0;
+    displayProgress = trackDuration > 0 ? (currentPosition / trackDuration) * 100 : 0;
 }
 
 function renderTick() {
-    updateInterpolatedPosition();
+    updateDisplayPosition();
     updateAllDisplays();
 }
 
@@ -159,7 +202,7 @@ function connectElgatoStreamDeckSocket(inPort, inPluginUUID, inRegisterEvent, in
     websocket.onopen = function() {
         websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inPluginUUID }));
         websocket.send(JSON.stringify({ event: "getGlobalSettings", context: inPluginUUID }));
-        log("Plugin connected - Ampdeck v1.0.1");
+        log("Plugin connected - Ampdeck v1.1.0");
     };
 
     websocket.onmessage = function(evt) {
@@ -173,6 +216,7 @@ function connectElgatoStreamDeckSocket(inPort, inPluginUUID, inRegisterEvent, in
             case "keyUp": onKeyUp(data); break;
             case "dialRotate": onDialRotate(data); break;
             case "dialDown": onDialDown(data); break;
+            case "touchTap": onTouchTap(data); break;
         }
     };
 }
@@ -186,6 +230,11 @@ function onWillAppear(data) {
 function onWillDisappear(data) {
     delete actions[data.context];
     delete lastLayoutState[data.context];
+    if (stripOverlays[data.context]) {
+        if (stripOverlays[data.context].timer) clearTimeout(stripOverlays[data.context].timer);
+        delete stripOverlays[data.context];
+    }
+    if (stripScrollState[data.context]) delete stripScrollState[data.context];
     if (buttonHoldState[data.context]) {
         clearInterval(buttonHoldState[data.context].seekInterval);
         delete buttonHoldState[data.context];
@@ -195,16 +244,19 @@ function onWillDisappear(data) {
 
 function onDidReceiveGlobalSettings(data) {
     globalSettings = data.payload.settings || {};
-    if (globalSettings.plexToken && globalSettings.plexServerUrl) pollPlex();
+    updateLogLevel();
+    logDebug("Global settings received", globalSettings);
+    if (globalSettings.plexToken && globalSettings.plexServerUrl) {
+        pollTimeline();
+    }
 }
 
 function onDidReceiveSettings(data) {
     if (actions[data.context]) actions[data.context].settings = data.payload.settings || {};
     applyGlobalFromSettings(data.payload.settings || {});
     saveGlobalSettings();
-    // Force layout refresh when appearance settings change
     lastLayoutState[data.context] = null;
-    updateInterpolatedPosition();
+    updateDisplayPosition();
     updateAllDisplays();
 }
 
@@ -212,9 +264,12 @@ function applyGlobalFromSettings(s) {
     if (s.plexServerUrl) globalSettings.plexServerUrl = s.plexServerUrl;
     if (s.plexToken) globalSettings.plexToken = s.plexToken;
     if (s.clientName) globalSettings.clientName = s.clientName;
+    if (s.playerUrl) globalSettings.playerUrl = s.playerUrl;
     if (s.syncOffset !== undefined) globalSettings.syncOffset = s.syncOffset;
     if (s.textColor) globalSettings.textColor = s.textColor;
     if (s.dynamicColors !== undefined) globalSettings.dynamicColors = s.dynamicColors;
+    if (s.debugMode !== undefined) globalSettings.debugMode = s.debugMode;
+    updateLogLevel();
 }
 
 // ============================================
@@ -244,6 +299,8 @@ function onKeyUp(data) {
         if (action === "com.rackemrack.ampdeck.album-art" || action === "com.rackemrack.ampdeck.play-pause") togglePlayPause();
         else if (action === "com.rackemrack.ampdeck.previous") skipPrevious();
         else if (action === "com.rackemrack.ampdeck.next") skipNext();
+        else if (action === "com.rackemrack.ampdeck.shuffle") toggleShuffle();
+        else if (action === "com.rackemrack.ampdeck.repeat") cycleRepeat();
     }
     delete buttonHoldState[ctx];
 }
@@ -258,11 +315,17 @@ function onDialRotate(data) {
     var ticks = data.payload.ticks || 0;
 
     if (dialAction === "skip") {
-        if (ticks > 0) skipNext();
-        else if (ticks < 0) skipPrevious();
+        if (ticks > 0) {
+            skipNext();
+            showStripOverlay(ctx, "NEXT", "▶▶");
+        } else if (ticks < 0) {
+            skipPrevious();
+            showStripOverlay(ctx, "PREVIOUS", "◀◀");
+        }
     } else if (dialAction === "volume") {
         var newVolume = Math.max(0, Math.min(100, currentVolume + (ticks * VOLUME_STEP)));
         setVolume(newVolume);
+        showStripOverlay(ctx, "VOLUME", newVolume + "%");
     }
 }
 
@@ -270,68 +333,173 @@ function onDialDown(data) {
     var ctx = data.context;
     var settings = actions[ctx] ? actions[ctx].settings : {};
     var dialAction = settings.dialAction || "none";
+    var dialPressAction = settings.dialPressAction || "playpause";
 
-    if (dialAction !== "none") {
+    if (dialAction === "none") return;
+
+    if (dialPressAction === "playpause") {
         togglePlayPause();
+        showStripOverlay(ctx, playbackState === "playing" ? "PLAYING" : "PAUSED", "");
+    } else if (dialPressAction === "shuffle") {
+        toggleShuffle();
+        showStripOverlay(ctx, "SHUFFLE", currentShuffle ? "ON" : "OFF");
+    } else if (dialPressAction === "repeat") {
+        cycleRepeat();
+        var repeatLabels = { 0: "OFF", 1: "ONE", 2: "ALL" };
+        showStripOverlay(ctx, "REPEAT", repeatLabels[currentRepeat] || "OFF");
     }
 }
 
 // ============================================
-// PLEX PLAYBACK CONTROL
+// TOUCH TAP (touch strip play/pause)
 // ============================================
+function onTouchTap(data) {
+    var ctx = data.context;
+    togglePlayPause();
+    showStripOverlay(ctx, playbackState === "playing" ? "PLAYING" : "PAUSED", "");
+}
+
+// ============================================
+// TOUCH STRIP OVERLAY
+// ============================================
+function showStripOverlay(ctx, text, subtext) {
+    if (!stripOverlays[ctx]) stripOverlays[ctx] = { active: false, text: "", subtext: "", timer: null };
+    var ov = stripOverlays[ctx];
+    if (ov.timer) clearTimeout(ov.timer);
+    ov.active = true;
+    ov.text = text;
+    ov.subtext = subtext;
+    updateAllDisplays();
+    ov.timer = setTimeout(function() {
+        ov.active = false;
+        ov.timer = null;
+        lastLayoutState[ctx] = null;
+        updateAllDisplays();
+    }, 1500);
+}
+
+// ============================================
+// PLAYBACK COMMANDS (Local Player API)
+// ============================================
+function playerCommand(path, extraParams) {
+    var playerUrl = getPlayerUrl();
+    var cmdId = getNextCommandID();
+    var url = playerUrl + path;
+
+    var params = "commandID=" + cmdId;
+    if (extraParams) params += "&" + extraParams;
+
+    if (url.indexOf("?") >= 0) url += "&" + params;
+    else url += "?" + params;
+
+    logDebug("Player command: " + url);
+
+    return fetch(url, {
+        headers: { "X-Plex-Client-Identifier": CLIENT_IDENTIFIER }
+    }).then(function(r) {
+        if (!r.ok) {
+            logError("Player command failed: HTTP " + r.status + " for " + path);
+            return serverCommand(path, extraParams);
+        }
+        logDebug("Player command OK: " + path);
+        localPlayerConnected = true;
+        return r;
+    }).catch(function(e) {
+        logWarn("Player command error (" + path + "): " + e.message + ". Falling back to server.");
+        localPlayerConnected = false;
+        return serverCommand(path, extraParams);
+    });
+}
+
+function serverCommand(path, extraParams) {
+    var machineId = getClientId();
+    if (!machineId || !globalSettings.plexServerUrl || !globalSettings.plexToken) {
+        logError("Server command failed: missing machineId, server URL, or token");
+        return Promise.reject(new Error("Missing server config"));
+    }
+
+    var url = globalSettings.plexServerUrl + path + "?commandID=1"
+        + "&X-Plex-Token=" + globalSettings.plexToken
+        + "&X-Plex-Target-Client-Identifier=" + machineId;
+
+    if (extraParams) url += "&" + extraParams;
+
+    logDebug("Server fallback command: " + url);
+
+    return fetch(url).then(function(r) {
+        if (!r.ok) logError("Server command failed: HTTP " + r.status + " for " + path);
+        else logDebug("Server command OK: " + path);
+        return r;
+    }).catch(function(e) {
+        logError("Server command error (" + path + "): " + e.message);
+    });
+}
+
 function getClientId() {
     if (currentTrack && currentTrack.Player) return currentTrack.Player.machineIdentifier;
     return null;
 }
 
-function plexCommand(path) {
-    var machineId = getClientId();
-    if (!machineId || !globalSettings.plexServerUrl || !globalSettings.plexToken) return;
-    var url = globalSettings.plexServerUrl + path + "?commandID=1&X-Plex-Token=" + globalSettings.plexToken + "&X-Plex-Target-Client-Identifier=" + machineId;
-    fetch(url).catch(function(e) { log("Cmd error: " + e.message); });
-}
-
 function togglePlayPause() {
     if (playbackState === "stopped") return;
     var cmd = playbackState === "playing" ? "pause" : "play";
-    plexCommand("/player/playback/" + cmd);
+    playerCommand("/player/playback/" + cmd);
+
     if (playbackState === "playing") {
         playbackState = "paused";
-        serverPosition = displayPosition;
-        serverTimestamp = Date.now();
+        lastPositionTimestamp = 0;
     } else {
         playbackState = "playing";
-        serverTimestamp = Date.now();
+        lastPositionTimestamp = Date.now();
     }
-    updateInterpolatedPosition();
+    updateDisplayPosition();
     updateAllDisplays();
 }
 
-function skipNext() { plexCommand("/player/playback/skipNext"); }
-function skipPrevious() { plexCommand("/player/playback/skipPrevious"); }
+function skipNext() {
+    playerCommand("/player/playback/skipNext");
+}
+
+function skipPrevious() {
+    playerCommand("/player/playback/skipPrevious");
+}
 
 function seekTrack(offsetMs) {
-    var machineId = getClientId();
-    if (!machineId) return;
-    var newPos = Math.max(0, Math.min(displayPosition + offsetMs, trackDuration));
-    var url = globalSettings.plexServerUrl + "/player/playback/seekTo?commandID=1&offset=" + Math.round(newPos) + "&X-Plex-Token=" + globalSettings.plexToken + "&X-Plex-Target-Client-Identifier=" + machineId;
-    fetch(url).then(function() {
-        serverPosition = newPos;
-        lastServerPosition = -1;
-        serverTimestamp = Date.now();
-        updateInterpolatedPosition();
+    var newPos = Math.max(0, Math.min(currentPosition + offsetMs, trackDuration));
+    playerCommand("/player/playback/seekTo", "offset=" + Math.round(newPos)).then(function() {
+        currentPosition = newPos;
+        lastPositionTimestamp = Date.now();
+        updateDisplayPosition();
         updateAllDisplays();
-    }).catch(function(e) { log("Seek error: " + e.message); });
+    });
 }
 
 function setVolume(level) {
-    var machineId = getClientId();
-    if (!machineId || !globalSettings.plexServerUrl || !globalSettings.plexToken) return;
     currentVolume = Math.max(0, Math.min(100, level));
-    var url = globalSettings.plexServerUrl + "/player/playback/setParameters?volume=" + currentVolume + "&commandID=1&X-Plex-Token=" + globalSettings.plexToken + "&X-Plex-Target-Client-Identifier=" + machineId;
-    fetch(url).then(function() {
-        log("Volume: " + currentVolume);
-    }).catch(function(e) { log("Volume error: " + e.message); });
+    playerCommand("/player/playback/setParameters", "volume=" + currentVolume).then(function() {
+        logDebug("Volume set: " + currentVolume);
+    });
+}
+
+function toggleShuffle() {
+    currentShuffle = currentShuffle ? 0 : 1;
+    playerCommand("/player/playback/setParameters", "shuffle=" + currentShuffle).then(function() {
+        logDebug("Shuffle: " + (currentShuffle ? "ON" : "OFF"));
+    });
+    updateAllDisplays();
+}
+
+function cycleRepeat() {
+    // Plex API: 0=Off, 1=One track, 2=All/Queue
+    // Cycle: Off(0) → All(2) → One(1) → Off(0)
+    if (currentRepeat === 0) currentRepeat = 2;
+    else if (currentRepeat === 2) currentRepeat = 1;
+    else currentRepeat = 0;
+    playerCommand("/player/playback/setParameters", "repeat=" + currentRepeat).then(function() {
+        var labels = { 0: "Off", 1: "One", 2: "All" };
+        logDebug("Repeat: " + labels[currentRepeat]);
+    });
+    updateAllDisplays();
 }
 
 function saveGlobalSettings() {
@@ -341,32 +509,288 @@ function saveGlobalSettings() {
 }
 
 // ============================================
-// PLEX API
+// TIMELINE POLL (Real-time playback data)
 // ============================================
-function fetchAlbumTrackCount(parentRatingKey) {
-    if (!parentRatingKey || !globalSettings.plexServerUrl || !globalSettings.plexToken) return;
-    if (parentRatingKey === lastParentRatingKey && albumTrackCount !== null) return;
+function pollTimeline() {
+    var playerUrl = getPlayerUrl();
+    var cmdId = getNextCommandID();
+    var url = playerUrl + "/player/timeline/poll?wait=0&commandID=" + cmdId + "&includeMetadata=1";
 
-    lastParentRatingKey = parentRatingKey;
-    albumTrackCount = null;
+    logDebug("Timeline poll: " + url);
 
-    var url = globalSettings.plexServerUrl + "/library/metadata/" + parentRatingKey + "/children?X-Plex-Token=" + globalSettings.plexToken;
-    fetch(url, { headers: { "Accept": "application/json" } })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data && data.MediaContainer && data.MediaContainer.size) {
-                albumTrackCount = data.MediaContainer.size;
-                log("Album tracks: " + albumTrackCount);
-            }
-        })
-        .catch(function(e) { log("Track count error: " + e.message); });
+    fetch(url, {
+        headers: { "X-Plex-Client-Identifier": CLIENT_IDENTIFIER }
+    })
+    .then(function(r) {
+        if (!r.ok) {
+            logWarn("Timeline poll failed: HTTP " + r.status + ". Falling back to server poll.");
+            localPlayerConnected = false;
+            pollPlexServer();
+            return null;
+        }
+        localPlayerConnected = true;
+        return r.text();
+    })
+    .then(function(xmlText) {
+        if (!xmlText) return;
+        processTimeline(xmlText);
+    })
+    .catch(function(e) {
+        logWarn("Timeline poll error: " + e.message + ". Falling back to server poll.");
+        localPlayerConnected = false;
+        pollPlexServer();
+    });
 }
 
-function pollPlex() {
-    if (!globalSettings.plexToken || !globalSettings.plexServerUrl) return;
+function processTimeline(xmlText) {
+    logDebug("Timeline XML received (" + xmlText.length + " chars)");
+
+    var parser = new DOMParser();
+    var doc = parser.parseFromString(xmlText, "text/xml");
+
+    var timelines = doc.querySelectorAll("Timeline");
+    var musicTimeline = null;
+    for (var i = 0; i < timelines.length; i++) {
+        if (timelines[i].getAttribute("type") === "music") {
+            musicTimeline = timelines[i];
+            break;
+        }
+    }
+
+    if (!musicTimeline) {
+        logDebug("No music timeline found");
+        handleNoSession();
+        return;
+    }
+
+    var state = musicTimeline.getAttribute("state") || "stopped";
+
+    if (state === "stopped") {
+        logDebug("Music timeline state: stopped");
+        handleNoSession();
+        return;
+    }
+
+    var time = parseInt(musicTimeline.getAttribute("time")) || 0;
+    var duration = parseInt(musicTimeline.getAttribute("duration")) || 0;
+    var volume = parseInt(musicTimeline.getAttribute("volume"));
+    var ratingKey = musicTimeline.getAttribute("ratingKey");
+    var shuffle = musicTimeline.getAttribute("shuffle");
+    var repeat = musicTimeline.getAttribute("repeat");
+
+    var machineIdentifier = musicTimeline.getAttribute("machineIdentifier");
+    var address = musicTimeline.getAttribute("address");
+    var port = musicTimeline.getAttribute("port");
+    var protocol = musicTimeline.getAttribute("protocol");
+    var token = musicTimeline.getAttribute("token");
+
+    var newState = state === "buffering" ? "playing" : state;
+    playbackState = newState;
+    currentPosition = time;
+    trackDuration = duration;
+    lastPositionTimestamp = (newState === "playing") ? Date.now() : 0;
+
+    if (!isNaN(volume)) currentVolume = volume;
+    if (shuffle !== null) currentShuffle = parseInt(shuffle) || 0;
+    if (repeat !== null) currentRepeat = parseInt(repeat) || 0;
+
+    var trackElements = doc.querySelectorAll("Track");
+    var trackEl = trackElements.length > 0 ? trackElements[0] : null;
+
+    var trackChanged = ratingKey !== lastTimelineRatingKey;
+    lastTimelineRatingKey = ratingKey;
+
+    if (trackEl) {
+        logDebug("Timeline includes metadata for track: " + (trackEl.getAttribute("title") || "unknown"));
+        updateTrackFromTimelineMetadata(trackEl, machineIdentifier, address, port, protocol, token);
+    } else if (trackChanged && ratingKey) {
+        logDebug("Track changed (ratingKey: " + ratingKey + "), fetching metadata from server");
+        fetchTrackMetadata(ratingKey, machineIdentifier, address, port, protocol, token);
+    }
+
+    updateDisplayPosition();
+    updateAllDisplays();
+}
+
+function updateTrackFromTimelineMetadata(trackEl, machineId, address, port, protocol, token) {
+    var track = {
+        title: trackEl.getAttribute("title") || "Unknown",
+        grandparentTitle: trackEl.getAttribute("grandparentTitle") || "Unknown",
+        parentTitle: trackEl.getAttribute("parentTitle") || "Unknown",
+        ratingKey: trackEl.getAttribute("ratingKey"),
+        parentRatingKey: trackEl.getAttribute("parentRatingKey"),
+        index: trackEl.getAttribute("index"),
+        duration: parseInt(trackEl.getAttribute("duration")) || trackDuration,
+        type: "track",
+        Player: {
+            machineIdentifier: machineId,
+            state: playbackState,
+            product: "Plexamp"
+        }
+    };
+
+    var mediaEl = trackEl.querySelector("Media");
+    if (mediaEl) {
+        track.Media = [{
+            audioCodec: mediaEl.getAttribute("audioCodec") || "",
+            bitrate: parseInt(mediaEl.getAttribute("bitrate")) || 0,
+            audioChannels: parseInt(mediaEl.getAttribute("audioChannels")) || 0
+        }];
+        var partEl = mediaEl.querySelector("Part");
+        if (partEl) {
+            var streamEl = partEl.querySelector("Stream");
+            if (streamEl) {
+                track.Media[0].samplingRate = parseInt(streamEl.getAttribute("samplingRate")) || 0;
+                track.Media[0].bitDepth = parseInt(streamEl.getAttribute("bitDepth")) || 0;
+            }
+        }
+    }
+
+    track.thumb = trackEl.getAttribute("thumb") || "";
+    track.parentThumb = trackEl.getAttribute("parentThumb") || "";
+    track.grandparentThumb = trackEl.getAttribute("grandparentThumb") || "";
+
+    var trackChanged = !currentTrack || currentTrack.ratingKey !== track.ratingKey;
+    currentTrack = track;
+
+    if (trackChanged) {
+        albumTrackCount = null;
+        if (track.parentRatingKey) fetchAlbumTrackCount(track.parentRatingKey);
+
+        var artPath = track.thumb || track.parentThumb || track.grandparentThumb;
+        if (artPath && artPath !== lastArtPath) {
+            lastArtPath = artPath;
+            fetchAlbumArtFromTimeline(artPath, address, port, protocol, token);
+        }
+    }
+}
+
+function fetchTrackMetadata(ratingKey, machineId, address, port, protocol, token) {
+    var serverUrl = globalSettings.plexServerUrl;
+    var serverToken = globalSettings.plexToken;
+
+    if (address && port && protocol && token) {
+        serverUrl = protocol + "://" + address + ":" + port;
+        serverToken = token;
+    }
+
+    if (!serverUrl || !serverToken) {
+        logWarn("Cannot fetch metadata: no server connection info");
+        return;
+    }
+
+    var url = serverUrl + "/library/metadata/" + ratingKey + "?X-Plex-Token=" + serverToken;
+    logDebug("Fetching track metadata: " + url);
+
+    fetch(url, { headers: { "Accept": "application/json" } })
+        .then(function(r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        })
+        .then(function(data) {
+            if (data && data.MediaContainer && data.MediaContainer.Metadata && data.MediaContainer.Metadata.length > 0) {
+                var meta = data.MediaContainer.Metadata[0];
+                meta.Player = {
+                    machineIdentifier: machineId || getClientId(),
+                    state: playbackState,
+                    product: "Plexamp"
+                };
+                currentTrack = meta;
+                serverConnected = true;
+
+                albumTrackCount = null;
+                if (meta.parentRatingKey) fetchAlbumTrackCount(meta.parentRatingKey);
+
+                var artPath = meta.thumb || meta.parentThumb || meta.grandparentThumb;
+                if (artPath && artPath !== lastArtPath) {
+                    lastArtPath = artPath;
+                    fetchAlbumArt(artPath);
+                }
+
+                updateAllDisplays();
+            }
+        })
+        .catch(function(e) {
+            logError("Metadata fetch error: " + e.message);
+        });
+}
+
+function fetchAlbumArtFromTimeline(thumbPath, address, port, protocol, token) {
+    var serverUrl = globalSettings.plexServerUrl;
+    var serverToken = globalSettings.plexToken;
+
+    if (address && port && protocol && token) {
+        serverUrl = protocol + "://" + address + ":" + port;
+        serverToken = token;
+    }
+
+    if (!serverUrl || !serverToken) {
+        logWarn("Cannot fetch album art: no server connection info");
+        return;
+    }
+
+    var url = serverUrl + thumbPath + "?X-Plex-Token=" + serverToken;
+    logDebug("Fetching album art: " + url);
+
+    fetch(url)
+        .then(function(r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.blob();
+        })
+        .then(function(blob) {
+            var reader = new FileReader();
+            reader.onloadend = function() {
+                currentAlbumArt = reader.result;
+                extractDominantColor(currentAlbumArt).then(function(color) {
+                    dominantColor = color;
+                    updateDisplayPosition();
+                    updateAllDisplays();
+                });
+            };
+            reader.readAsDataURL(blob);
+        })
+        .catch(function(e) {
+            logError("Album art fetch error: " + e.message);
+        });
+}
+
+function handleNoSession() {
+    if (currentTrack !== null || playbackState !== "stopped") {
+        currentTrack = null;
+        playbackState = "stopped";
+        currentPosition = 0;
+        lastPositionTimestamp = 0;
+        trackDuration = 0;
+        albumTrackCount = null;
+        lastParentRatingKey = null;
+        lastTimelineRatingKey = null;
+        lastArtPath = null;
+        currentAlbumArt = null;
+        dominantColor = "#E5A00D";
+        currentShuffle = 0;
+        currentRepeat = 0;
+        updateDisplayPosition();
+        updateAllDisplays();
+    }
+}
+
+// ============================================
+// SERVER POLL FALLBACK
+// ============================================
+function pollPlexServer() {
+    if (!globalSettings.plexToken || !globalSettings.plexServerUrl) {
+        logDebug("Server poll skipped: missing token or URL");
+        return;
+    }
+
+    logDebug("Falling back to server session poll");
 
     fetch(globalSettings.plexServerUrl + "/status/sessions?X-Plex-Token=" + globalSettings.plexToken, { headers: { "Accept": "application/json" } })
-        .then(function(r) { return r.json(); })
+        .then(function(r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            serverConnected = true;
+            return r.json();
+        })
         .then(function(data) {
             var track = findPlexampSession(data);
 
@@ -376,14 +800,9 @@ function pollPlex() {
                 var newPosition = track.viewOffset || 0;
                 var trackChanged = !currentTrack || currentTrack.ratingKey !== track.ratingKey;
 
-                // Only reset interpolation anchor when Plex reports a genuinely different position.
-                // Avoids the "count up, snap back, repeat" loop caused by stale Plex data.
-                if (newPosition !== lastServerPosition || trackChanged) {
-                    var syncOffset = globalSettings.syncOffset !== undefined ? parseInt(globalSettings.syncOffset) : 1500;
-                    serverPosition = newPosition + syncOffset;
-                    serverTimestamp = Date.now();
-                    lastServerPosition = newPosition;
-                }
+                var syncOffset = globalSettings.syncOffset !== undefined ? parseInt(globalSettings.syncOffset) : 0;
+                currentPosition = newPosition + syncOffset;
+                lastPositionTimestamp = (newState === "playing") ? Date.now() : 0;
 
                 playbackState = newState;
                 trackDuration = newDuration;
@@ -399,24 +818,13 @@ function pollPlex() {
                     }
                 }
             } else {
-                if (currentTrack !== null || playbackState !== "stopped") {
-                    currentTrack = null;
-                    playbackState = "stopped";
-                    serverPosition = 0;
-                    serverTimestamp = 0;
-                    lastServerPosition = -1;
-                    trackDuration = 0;
-                    albumTrackCount = null;
-                    lastParentRatingKey = null;
-                    lastArtPath = null;
-                    currentAlbumArt = null;
-                    dominantColor = "#E5A00D";
-                    updateInterpolatedPosition();
-                    updateAllDisplays();
-                }
+                handleNoSession();
             }
         })
-        .catch(function(e) { log("Poll error: " + e.message); });
+        .catch(function(e) {
+            logError("Server poll error: " + e.message);
+            serverConnected = false;
+        });
 }
 
 function findPlexampSession(data) {
@@ -433,22 +841,52 @@ function findPlexampSession(data) {
     return null;
 }
 
+// ============================================
+// PLEX SERVER API (metadata, art, track count)
+// ============================================
+function fetchAlbumTrackCount(parentRatingKey) {
+    if (!parentRatingKey || !globalSettings.plexServerUrl || !globalSettings.plexToken) return;
+    if (parentRatingKey === lastParentRatingKey && albumTrackCount !== null) return;
+
+    lastParentRatingKey = parentRatingKey;
+    albumTrackCount = null;
+
+    var url = globalSettings.plexServerUrl + "/library/metadata/" + parentRatingKey + "/children?X-Plex-Token=" + globalSettings.plexToken;
+    fetch(url, { headers: { "Accept": "application/json" } })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data && data.MediaContainer && data.MediaContainer.size) {
+                albumTrackCount = data.MediaContainer.size;
+                logDebug("Album tracks: " + albumTrackCount);
+            }
+        })
+        .catch(function(e) { logError("Track count error: " + e.message); });
+}
+
 function fetchAlbumArt(thumbPath) {
-    fetch(globalSettings.plexServerUrl + thumbPath + "?X-Plex-Token=" + globalSettings.plexToken)
-        .then(function(r) { return r.blob(); })
+    if (!globalSettings.plexServerUrl || !globalSettings.plexToken) return;
+
+    var url = globalSettings.plexServerUrl + thumbPath + "?X-Plex-Token=" + globalSettings.plexToken;
+    logDebug("Fetching album art (server): " + url);
+
+    fetch(url)
+        .then(function(r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.blob();
+        })
         .then(function(blob) {
             var reader = new FileReader();
             reader.onloadend = function() {
                 currentAlbumArt = reader.result;
                 extractDominantColor(currentAlbumArt).then(function(color) {
                     dominantColor = color;
-                    updateInterpolatedPosition();
+                    updateDisplayPosition();
                     updateAllDisplays();
                 });
             };
             reader.readAsDataURL(blob);
         })
-        .catch(function(e) { log("Art error: " + e.message); });
+        .catch(function(e) { logError("Art error: " + e.message); });
 }
 
 // ============================================
@@ -462,6 +900,8 @@ function updateAllDisplays() {
         else if (action === "com.rackemrack.ampdeck.play-pause") updatePlayPauseButton(ctx);
         else if (action === "com.rackemrack.ampdeck.info") updateInfoButton(ctx);
         else if (action === "com.rackemrack.ampdeck.time") updateTimeButton(ctx);
+        else if (action === "com.rackemrack.ampdeck.shuffle") updateShuffleButton(ctx);
+        else if (action === "com.rackemrack.ampdeck.repeat") updateRepeatButton(ctx);
     }
 }
 
@@ -590,7 +1030,7 @@ function updateTimeButton(ctx) {
         c.textAlign = "center";
         c.font = "bold 36px sans-serif";
         c.fillStyle = textColor;
-        c.fillText(formatTime(displayPosition), 72, 55);
+        c.fillText(formatTime(currentPosition), 72, 55);
 
         c.font = "20px sans-serif";
         c.fillStyle = secondaryColor;
@@ -606,8 +1046,132 @@ function updateTimeButton(ctx) {
     setImage(ctx, canvas.toDataURL("image/png"));
 }
 
+function updateShuffleButton(ctx) {
+    var canvas = document.createElement("canvas");
+    canvas.width = 144; canvas.height = 144;
+    var c = canvas.getContext("2d");
+    c.fillStyle = "#000000";
+    c.fillRect(0, 0, 144, 144);
+
+    var isOn = currentShuffle === 1;
+    var iconColor = isOn ? "#FFFFFF" : "#333333";
+
+    // Crossing arrows
+    c.strokeStyle = iconColor;
+    c.lineWidth = 6;
+    c.lineCap = "round";
+
+    c.beginPath();
+    c.moveTo(30, 52);
+    c.lineTo(65, 52);
+    c.lineTo(85, 86);
+    c.lineTo(110, 86);
+    c.stroke();
+
+    c.beginPath();
+    c.moveTo(30, 86);
+    c.lineTo(65, 86);
+    c.lineTo(85, 52);
+    c.lineTo(110, 52);
+    c.stroke();
+
+    // Arrowheads
+    c.fillStyle = iconColor;
+    c.beginPath();
+    c.moveTo(105, 41);
+    c.lineTo(120, 52);
+    c.lineTo(105, 63);
+    c.closePath();
+    c.fill();
+
+    c.beginPath();
+    c.moveTo(105, 75);
+    c.lineTo(120, 86);
+    c.lineTo(105, 97);
+    c.closePath();
+    c.fill();
+
+    // State label - dynamic color, larger text
+    if (isOn) {
+        c.fillStyle = getAccentColor();
+        c.font = "bold 16px sans-serif";
+        c.textAlign = "center";
+        c.fillText("ON", 72, 130);
+    }
+
+    setImage(ctx, canvas.toDataURL("image/png"));
+}
+
+function updateRepeatButton(ctx) {
+    var canvas = document.createElement("canvas");
+    canvas.width = 144; canvas.height = 144;
+    var c = canvas.getContext("2d");
+    c.fillStyle = "#000000";
+    c.fillRect(0, 0, 144, 144);
+
+    var isOn = currentRepeat > 0;
+    var iconColor = isOn ? "#FFFFFF" : "#333333";
+
+    // Loop shape - shifted up to make room for label
+    c.strokeStyle = iconColor;
+    c.lineWidth = 6;
+
+    c.beginPath();
+    c.moveTo(35, 48);
+    c.lineTo(105, 48);
+    c.quadraticCurveTo(118, 48, 118, 61);
+    c.lineTo(118, 75);
+    c.quadraticCurveTo(118, 88, 105, 88);
+    c.lineTo(35, 88);
+    c.quadraticCurveTo(22, 88, 22, 75);
+    c.lineTo(22, 61);
+    c.quadraticCurveTo(22, 48, 35, 48);
+    c.stroke();
+
+    // Arrow
+    c.fillStyle = iconColor;
+    c.beginPath();
+    c.moveTo(95, 33);
+    c.lineTo(115, 48);
+    c.lineTo(95, 63);
+    c.closePath();
+    c.fill();
+
+    // "1" badge inside loop for repeat-one - secondary gray
+    if (currentRepeat === 1) {
+        c.fillStyle = getSecondaryTextColor();
+        c.font = "bold 28px sans-serif";
+        c.textAlign = "center";
+        c.fillText("1", 70, 78);
+    }
+
+    // State label - dynamic color, bold 16px (same as TRACK on info button)
+    // Plex API: 1=One, 2=All
+    if (currentRepeat === 2) {
+        c.fillStyle = getAccentColor();
+        c.font = "bold 16px sans-serif";
+        c.textAlign = "center";
+        c.fillText("ALL", 72, 128);
+    } else if (currentRepeat === 1) {
+        c.fillStyle = getAccentColor();
+        c.font = "bold 16px sans-serif";
+        c.textAlign = "center";
+        c.fillText("ONE", 72, 128);
+    }
+
+    setImage(ctx, canvas.toDataURL("image/png"));
+}
+
 function updateStripDisplay(ctx) {
     var settings = actions[ctx].settings || {};
+
+    // If overlay is active for THIS context, show overlay instead of normal content
+    var ov = stripOverlays[ctx];
+    if (ov && ov.active) {
+        renderStripOverlay(ctx, ov, settings);
+        return;
+    }
+
     var displayMode = settings.displayMode || "artist";
     var fontSize = parseInt(settings.fontSize) || 16;
     var totalPanels = parseInt(settings.progressTotalPanels) || 3;
@@ -616,7 +1180,6 @@ function updateStripDisplay(ctx) {
     var textColor = settings.textColor || getTextColor();
     var accentColor = getAccentColor();
 
-    // Compute dimmed version of the chosen text color for secondary text
     var stripSecondary;
     if (textColor === "#FFFFFF") stripSecondary = "#999999";
     else if (textColor === "#BBBBBB") stripSecondary = "#777777";
@@ -630,7 +1193,7 @@ function updateStripDisplay(ctx) {
         if (displayMode === "artist") { label = "ARTIST"; text = currentTrack.grandparentTitle || "Unknown"; }
         else if (displayMode === "album") { label = "ALBUM"; text = currentTrack.parentTitle || "Unknown"; }
         else if (displayMode === "track") { label = "TRACK"; text = currentTrack.title || "Unknown"; }
-        else if (displayMode === "time") { label = "TIME"; text = formatTime(displayPosition) + " / " + formatTime(trackDuration); }
+        else if (displayMode === "time") { label = "TIME"; text = formatTime(currentPosition) + " / " + formatTime(trackDuration); }
     } else {
         label = displayMode.toUpperCase();
         text = displayMode === "time" ? "0:00 / 0:00" : "Not Playing";
@@ -639,30 +1202,220 @@ function updateStripDisplay(ctx) {
     var labelSize = Math.max(14, Math.round(fontSize * 0.85));
     var progressBar = createProgressBarSegment(position, totalPanels, displayProgress, accentColor);
 
-    // Compute a layout key that captures all appearance-affecting state
     var pausedDim = playbackState === "paused";
-    var layoutKey = (pausedDim ? "p" : "a") + "|" + textColor + "|" + (pausedDim ? stripSecondary : textColor);
+    var labelColor = pausedDim ? stripSecondary : textColor;
+    var textDisplayColor = pausedDim ? stripSecondary : stripSecondary;
+
+    // Always use pixmap for displayText so font/position is consistent
+    var textAreaH = fontSize + 8;
+    var layoutKey = "px|" + labelColor + "|" + labelSize + "|" + textAreaH;
     if (lastLayoutState[ctx] !== layoutKey) {
         lastLayoutState[ctx] = layoutKey;
-
-        var labelColor = pausedDim ? stripSecondary : textColor;
-        var textDisplayColor = pausedDim ? stripSecondary : stripSecondary;
-
         setFeedbackLayout(ctx, {
             "id": "com.rackemrack.ampdeck.layout",
             "items": [
                 { "key": "label", "type": "text", "rect": [0, 15, 200, labelSize + 4],
                   "font": { "size": labelSize, "weight": 700 },
                   "color": labelColor, "alignment": "center" },
-                { "key": "displayText", "type": "text", "rect": [0, 15 + labelSize + 8, 200, fontSize + 8],
-                  "font": { "size": fontSize, "weight": 400 },
-                  "color": textDisplayColor, "alignment": "center" },
+                { "key": "displayText", "type": "pixmap", "rect": [0, 15 + labelSize + 8, 200, textAreaH] },
                 { "key": "progressBar", "type": "pixmap", "rect": [0, 82, 200, 4] }
             ]
         });
     }
 
-    setFeedback(ctx, { label: label, displayText: text, progressBar: progressBar });
+    // Check if text needs scrolling
+    var font = fontSize + "px sans-serif";
+    var needsScroll = measureTextWidth(text, font) > 190;
+
+    var textImage;
+    if (needsScroll) {
+        textImage = renderScrollingText(ctx, text, fontSize, textDisplayColor);
+    } else {
+        if (stripScrollState[ctx]) delete stripScrollState[ctx];
+        textImage = renderStaticText(text, fontSize, textDisplayColor);
+    }
+
+    setFeedback(ctx, { label: label, displayText: textImage, progressBar: progressBar });
+}
+
+// ============================================
+// SCROLLING TEXT
+// ============================================
+var stripScrollState = {};
+var SCROLL_SPEED = 30; // pixels per second
+var SCROLL_PAUSE_MS = 2000; // pause at start/end before scrolling
+var SCROLL_GAP = 40; // gap between end and repeat
+
+function measureTextWidth(text, font) {
+    var canvas = document.createElement("canvas");
+    var c = canvas.getContext("2d");
+    c.font = font;
+    return c.measureText(text).width;
+}
+
+function renderStaticText(text, fontSize, color) {
+    var canvasW = 200;
+    var canvasH = fontSize + 8;
+    var font = fontSize + "px sans-serif";
+
+    var canvas = document.createElement("canvas");
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    var c = canvas.getContext("2d");
+    c.clearRect(0, 0, canvasW, canvasH);
+    c.font = font;
+    c.fillStyle = color;
+    c.textAlign = "center";
+    c.textBaseline = "top";
+    c.fillText(text, canvasW / 2, 2);
+
+    return canvas.toDataURL("image/png");
+}
+
+function renderScrollingText(ctx, text, fontSize, color) {
+    var canvasW = 200;
+    var canvasH = fontSize + 8;
+    var font = fontSize + "px sans-serif";
+
+    // Get or create scroll state for this context
+    if (!stripScrollState[ctx]) {
+        stripScrollState[ctx] = { offset: 0, paused: true, pauseStart: Date.now(), lastTick: Date.now(), text: text };
+    }
+
+    var ss = stripScrollState[ctx];
+
+    // Reset scroll if text changed
+    if (ss.text !== text) {
+        ss.offset = 0;
+        ss.paused = true;
+        ss.pauseStart = Date.now();
+        ss.text = text;
+    }
+
+    var textW = measureTextWidth(text, font);
+    var maxOffset = textW - canvasW + SCROLL_GAP;
+
+    // Update scroll position
+    var now = Date.now();
+    var dt = (now - ss.lastTick) / 1000;
+    ss.lastTick = now;
+
+    if (ss.paused) {
+        if (now - ss.pauseStart >= SCROLL_PAUSE_MS) {
+            ss.paused = false;
+        }
+    } else {
+        ss.offset += SCROLL_SPEED * dt;
+        if (ss.offset >= maxOffset) {
+            ss.offset = 0;
+            ss.paused = true;
+            ss.pauseStart = now;
+        }
+    }
+
+    // Render
+    var canvas = document.createElement("canvas");
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    var c = canvas.getContext("2d");
+    c.clearRect(0, 0, canvasW, canvasH);
+    c.font = font;
+    c.fillStyle = color;
+    c.textBaseline = "top";
+    c.fillText(text, -ss.offset, 2);
+
+    return canvas.toDataURL("image/png");
+}
+
+// ============================================
+// STRIP OVERLAY
+// ============================================
+function renderStripOverlay(ctx, ov, settings) {
+    var accentColor = getAccentColor();
+    var fontSize = parseInt(settings.fontSize) || 16;
+    var labelSize = Math.max(14, Math.round(fontSize * 0.85));
+    var isPlayPause = (ov.text === "PLAYING" || ov.text === "PAUSED");
+
+    // Label uses accent color, same position/size as normal strip label
+    // Subtext area is a pixmap for icon rendering on play/pause
+    var overlayKey = "overlay|" + accentColor + "|" + labelSize + "|" + fontSize + "|" + (isPlayPause ? "pp" : "std");
+    if (lastLayoutState[ctx] !== overlayKey) {
+        lastLayoutState[ctx] = overlayKey;
+
+        setFeedbackLayout(ctx, {
+            "id": "com.rackemrack.ampdeck.layout",
+            "items": [
+                { "key": "label", "type": "text", "rect": [0, 15, 200, labelSize + 4],
+                  "font": { "size": labelSize, "weight": 700 },
+                  "color": accentColor, "alignment": "center" },
+                { "key": "displayText", "type": "pixmap", "rect": [0, 15 + labelSize + 8, 200, fontSize + 16] },
+                { "key": "progressBar", "type": "pixmap", "rect": [0, 82, 200, 4] }
+            ]
+        });
+    }
+
+    // Render subtext area as canvas
+    var subtextH = fontSize + 16;
+    var subtextCanvas = document.createElement("canvas");
+    subtextCanvas.width = 200;
+    subtextCanvas.height = subtextH;
+    var sc = subtextCanvas.getContext("2d");
+    sc.clearRect(0, 0, 200, subtextH);
+
+    if (isPlayPause) {
+        // Draw play or pause icon centered
+        var iconSize = Math.min(subtextH - 4, 24);
+        var cx = 100;
+        var cy = subtextH / 2;
+
+        sc.fillStyle = "#FFFFFF";
+        if (ov.text === "PLAYING") {
+            // Pause icon (two bars)
+            var barW = Math.round(iconSize * 0.25);
+            var barH = iconSize;
+            var gap = Math.round(iconSize * 0.2);
+            sc.fillRect(cx - gap - barW, cy - barH / 2, barW, barH);
+            sc.fillRect(cx + gap, cy - barH / 2, barW, barH);
+        } else {
+            // Play icon (triangle)
+            var triH = iconSize;
+            var triW = Math.round(iconSize * 0.8);
+            sc.beginPath();
+            sc.moveTo(cx - triW / 2, cy - triH / 2);
+            sc.lineTo(cx + triW / 2, cy);
+            sc.lineTo(cx - triW / 2, cy + triH / 2);
+            sc.closePath();
+            sc.fill();
+        }
+    } else {
+        // Standard text subtext
+        sc.font = "bold " + fontSize + "px sans-serif";
+        sc.fillStyle = "#FFFFFF";
+        sc.textAlign = "center";
+        sc.textBaseline = "middle";
+        sc.fillText(ov.subtext, 100, subtextH / 2);
+    }
+
+    // Progress/volume bar
+    var barCanvas = document.createElement("canvas");
+    barCanvas.width = 200; barCanvas.height = 4;
+    var bc = barCanvas.getContext("2d");
+    bc.fillStyle = "#333333";
+    bc.fillRect(0, 0, 200, 4);
+
+    if (ov.text === "VOLUME") {
+        var fillW = Math.round((currentVolume / 100) * 200);
+        if (fillW > 0) {
+            bc.fillStyle = accentColor;
+            bc.fillRect(0, 0, fillW, 4);
+        }
+    }
+
+    setFeedback(ctx, {
+        label: ov.text,
+        displayText: subtextCanvas.toDataURL("image/png"),
+        progressBar: barCanvas.toDataURL("image/png")
+    });
 }
 
 // ============================================
@@ -723,16 +1476,16 @@ function setFeedbackLayout(ctx, layout) {
 function startPolling() {
     if (pollWorker) return;
 
-    pollWorker = createTimerWorker(2000);
-    pollWorker.onmessage = function() { pollPlex(); };
+    pollWorker = createTimerWorker(1000);
+    pollWorker.onmessage = function() { pollTimeline(); };
     pollWorker.postMessage("start");
 
     renderWorker = createTimerWorker(200);
     renderWorker.onmessage = function() { renderTick(); };
     renderWorker.postMessage("start");
 
-    pollPlex();
-    log("Started: poll@2s, render@200ms");
+    pollTimeline();
+    log("Started: timeline poll@1s, render@200ms");
 }
 
 function stopPolling() {
@@ -741,4 +1494,4 @@ function stopPolling() {
     log("Stopped polling");
 }
 
-log("Ampdeck v1.0.1 loaded");
+log("Ampdeck v1.1.0 loaded");

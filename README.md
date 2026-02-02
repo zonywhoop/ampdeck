@@ -1,34 +1,53 @@
 # Ampdeck
 
-**The unofficial Plexamp plugin for Stream Deck+**
+**The unofficial Plexamp plugin for Stream Deck**
 
-<!-- Replace the line below with your render once it's ready -->
-<!-- ![Ampdeck on Stream Deck+](screenshots/hero.png) -->
+![Ampdeck on Stream Deck+](hero.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/rackemrack)
 
 ---
 
-Ampdeck brings Plexamp to your Stream Deck+. See your album art, track info, and playback time on the LCD keys, with a smooth animated progress bar spanning the touch strip — all updated in real time.
+Ampdeck brings Plexamp to your Stream Deck. See your album art, track info, and playback time on the LCD keys. All updated in real time. Stream Deck+ users get the full experience with a smooth animated progress bar spanning the touch strip and configurable dial controls.
 
 ## Features
 
 - **Album Art** — Live album art on any LCD key with a pause overlay. Tap to play/pause.
-- **Now Playing Strip** — Artist, album, track, or elapsed time on each touch strip panel.
-- **Dial Controls** — Configurable dial actions: rotate to skip tracks or adjust volume, press to play/pause.
+- **Now Playing Strip** — Artist, album, track, or elapsed time on each touch strip panel with auto-scrolling for long text.
+- **Dial Controls** — Configurable dial actions: rotate to skip tracks or adjust volume. Press to play/pause, toggle shuffle, or cycle repeat.
+- **Touch Strip Controls** — Tap to play/pause with visual feedback overlays showing the action taken.
 - **Spanning Progress Bar** — A single progress bar that flows across all 4 dials, with colors extracted from album art.
 - **Play / Pause** — Dedicated button with instant visual feedback.
 - **Previous / Next** — Tap to skip tracks. Hold to seek forward or backward.
+- **Shuffle** — Toggle shuffle on/off with visual state indicator.
+- **Repeat** — Cycle through repeat modes: Off → All → One.
 - **Track Info** — Audio codec, bitrate, and track number at a glance.
 - **Time Elapsed** — Large elapsed/total time display with its own progress bar.
 - **Dynamic Colors** — Progress bar and accent colors adapt to the current album art, or lock to orange if you prefer.
 - **Configurable Text Colors** — Choose from White, Light Gray, Orange, Amber, or Black to match your setup.
-- **Smooth Interpolation** — Time display updates at 200ms with configurable sync offset to stay in sync with Plexamp.
+- **Direct Player Communication** — Commands go straight to Plexamp's local API for fast, reliable playback control with automatic server fallback.
+
+## Compatibility
+
+Ampdeck works on **any Stream Deck model** — the button actions (Album Art, Play/Pause, Previous, Next, Shuffle, Repeat, Track Info, Time Elapsed) work on every device with LCD keys. The Now Playing Strip with dials and progress bar is exclusive to the **Stream Deck+**.
+
+| Feature | Stream Deck / XL / MK.2 / Mini / Neo | Stream Deck+ |
+|---------|:-------------------------------------:|:------------:|
+| Album Art | ✓ | ✓ |
+| Play / Pause | ✓ | ✓ |
+| Previous / Next | ✓ | ✓ |
+| Shuffle | ✓ | ✓ |
+| Repeat | ✓ | ✓ |
+| Track Info | ✓ | ✓ |
+| Time Elapsed | ✓ | ✓ |
+| Now Playing Strip | — | ✓ |
+| Dial Controls | — | ✓ |
+| Spanning Progress Bar | — | ✓ |
 
 ## Requirements
 
-- [Stream Deck+](https://www.elgato.com/stream-deck-plus) (requires the touch strip and dials)
+- Any [Stream Deck](https://www.elgato.com/stream-deck) model (Stream Deck+ recommended for the full experience)
 - [Plexamp](https://www.plex.tv/plexamp/) running on the same network
 - A [Plex Media Server](https://www.plex.tv/media-server-downloads/) with your music library
 
@@ -68,12 +87,21 @@ That's it. No need to remove the old version first.
 1. Find **Ampdeck** in the actions list on the right side of the Stream Deck app
 2. Drag **Album Art** to any button
 3. Drag **Now Playing Strip** to all 4 dials
-4. Optionally drag **Play/Pause**, **Previous**, **Next**, **Track Info**, or **Time Elapsed** to buttons
+4. Optionally drag **Play/Pause**, **Previous**, **Next**, **Shuffle**, **Repeat**, **Track Info**, or **Time Elapsed** to buttons
 5. Click any Ampdeck action and configure:
-   - **Server URL** — Your Plex server address (e.g. `http://192.168.1.100:32400`)
-   - **Plex Token** — See [Finding Your Plex Token](#finding-your-plex-token) below
-   - **Client Name** — Your computer's name as it appears in the Plex dashboard
-6. Click **Test Connection** to verify
+
+### Connection Settings
+
+Ampdeck connects to both your local Plexamp player and your Plex server:
+
+| Setting | Description |
+|---------|-------------|
+| **Player URL** | Your Plexamp player address. Defaults to `http://localhost:32500` for headless Plexamp. Desktop users may need a different port — check Plexamp's settings. |
+| **Server URL** | Your Plex server address (e.g. `http://192.168.1.100:32400`) |
+| **Plex Token** | See [Finding Your Plex Token](#finding-your-plex-token) below |
+| **Client Name** | Your computer's name as it appears in the Plex dashboard (used for server fallback) |
+
+Use the **Test Player** button to verify the Plexamp connection and **Test Server** to verify the Plex server connection.
 
 ### Strip Configuration
 
@@ -83,7 +111,8 @@ Each dial panel can be configured independently:
 |---------|---------|
 | **Display Mode** | Artist, Album, Track Title, or Time |
 | **Font Size** | Small (12) through XX-Large (28) |
-| **Dial Action** | None, Next/Previous (rotate) + Play/Pause (press), or Volume (rotate) + Play/Pause (press) |
+| **Dial Action** | None, Next/Previous (rotate), or Volume (rotate) |
+| **Dial Press** | Play/Pause, Toggle Shuffle, or Cycle Repeat |
 | **Total Panels** | How many panels share the progress bar (1–4) |
 | **Panel Position** | This panel's position in the progress bar sequence, or None to disable |
 | **Text Color** | White, Light Gray, Orange, Amber, or Black |
@@ -91,9 +120,12 @@ Each dial panel can be configured independently:
 
 For example, to have the progress bar span all 4 dials: set each panel to "4 panels" and positions 1, 2, 3, 4 from left to right.
 
-### Sync Offset
+### Advanced Settings
 
-Plex reports playback position with a slight delay. The **Time Offset** setting (default: 1500ms) compensates for this so Ampdeck stays in sync with what you hear. Increase it if the display feels behind, decrease it if it feels ahead.
+| Setting | Description |
+|---------|-------------|
+| **Time Offset** | Compensates for network latency between the player and the display. Defaults to 0ms. Only needed if the time display feels ahead or behind. |
+| **Debug Logging** | When enabled, logs detailed API requests and connection state to the browser console. Plex tokens are automatically sanitized in log output for safe sharing. |
 
 ## Finding Your Plex Token
 
@@ -110,11 +142,17 @@ For more details, see the [Plex support article](https://support.plex.tv/article
 
 | Problem | Solution |
 |---------|----------|
-| Plugin not showing in actions list | Make sure Stream Deck was fully closed before running `install.bat` |
-| Connection test fails | Verify your server URL includes the port (`:32400`) and your token is correct |
-| Nothing displays | Confirm Plexamp is actively playing and the client name matches exactly |
-| Time display is off | Adjust the Sync Offset in the action settings (try values between 1000–2000) |
+| Plugin not showing in actions list | Make sure Stream Deck was fully closed before running `install.bat` or `install.sh` |
+| Player test fails | Verify Plexamp is running and the Player URL is correct. Headless Plexamp defaults to port 32500. Desktop Plexamp may use a different port. |
+| Server test fails | Verify your server URL includes the port (`:32400`) and your token is correct |
+| Buttons not working | This is usually a connection issue. Enable debug logging and check the browser console (`http://localhost:23654`) for errors. |
+| Nothing displays | Confirm Plexamp is actively playing. Check both Player and Server test buttons. |
+| Time display is off | Adjust the Time Offset in Advanced settings (try small values like 500–1000) |
 | Progress bar not aligned | Check that all strip panels have matching Total Panels values |
+
+### Debug Logging
+
+If something isn't working, enable **Debug Logging** in the Advanced section of any Ampdeck action's settings. Then open the Stream Deck remote debugger at `http://localhost:23654` in your browser to see detailed logs. Plex tokens are automatically masked in log output, so it's safe to share logs when reporting issues.
 
 ## Manual Installation
 
@@ -134,7 +172,7 @@ Then restart Stream Deck.
 
 ## Support
 
-If Ampdeck is useful to you, consider [buying me a coffee](https://ko-fi.com/rackemrack). It's totally optional — the plugin is free and always will be.
+If Ampdeck is useful to you, consider [buying me a coffee](https://ko-fi.com/rackemrack). It's totally optional; The plugin is free and always will be.
 
 ## License
 

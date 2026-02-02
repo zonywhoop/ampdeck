@@ -6,7 +6,7 @@
   "Name": "Ampdeck",
   "Icon": "imgs/plugin-icon",
   "URL": "https://plex.tv",
-  "Version": "1.0.1",
+  "Version": "1.1.0",
   "Category": "Ampdeck",
   "CategoryIcon": "imgs/category-icon",
   "OS": [
@@ -53,8 +53,8 @@
         "layout": "layouts/now-playing.json",
         "TriggerDescription": {
           "Rotate": "Next / Previous or Volume",
-          "Push": "Play / Pause",
-          "Touch": "Unused"
+          "Push": "Play/Pause, Shuffle, or Repeat (configurable)",
+          "Touch": "Play / Pause"
         }
       },
       "PropertyInspectorPath": "pi-strip.html"
@@ -127,6 +127,34 @@
       "SupportedInMultiActions": false,
       "Tooltip": "Shows elapsed / total time with progress bar",
       "UUID": "com.rackemrack.ampdeck.time",
+      "PropertyInspectorPath": "pi.html"
+    },
+    {
+      "Icon": "imgs/shuffle-icon",
+      "Name": "Shuffle",
+      "States": [
+        {
+          "Image": "imgs/shuffle-default",
+          "ShowTitle": false
+        }
+      ],
+      "SupportedInMultiActions": true,
+      "Tooltip": "Toggle shuffle on/off",
+      "UUID": "com.rackemrack.ampdeck.shuffle",
+      "PropertyInspectorPath": "pi.html"
+    },
+    {
+      "Icon": "imgs/repeat-icon",
+      "Name": "Repeat",
+      "States": [
+        {
+          "Image": "imgs/repeat-default",
+          "ShowTitle": false
+        }
+      ],
+      "SupportedInMultiActions": true,
+      "Tooltip": "Cycle repeat: Off → All → One",
+      "UUID": "com.rackemrack.ampdeck.repeat",
       "PropertyInspectorPath": "pi.html"
     }
   ],
